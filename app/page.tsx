@@ -16,7 +16,7 @@ export default function Dashboard() {
     const runAnalysis = async () => {
       setLoading(true);
       try {
-        const response = await fetch('http://localhost:8000/analyze', {
+        const response = await fetch('http://localhost:8000/api/analyze', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

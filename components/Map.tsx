@@ -8,7 +8,7 @@ import MapLegend from './MapLegend';
 
 interface MapComponentProps {
   year: number;
-  analysisData: any;
+  analysisData: Record<string, unknown> | null;
   isLoading?: boolean;
 }
 
@@ -21,6 +21,8 @@ const COLORS = {
 
 const MapComponent = ({ year, analysisData, isLoading }: MapComponentProps) => {
   const mapRef = useRef<MapRef>(null);
+  const [mode, setMode] = useState<'natural' | 'ndvi'>('natural');
+  const [mapLoaded, setMapLoaded] = useState(false);
   const [viewState, setViewState] = useState({
     longitude: 88.85, // Sundarbans longitude
     latitude: 21.9, // Sundarbans latitude
@@ -30,49 +32,71 @@ const MapComponent = ({ year, analysisData, isLoading }: MapComponentProps) => {
   // Stadia Maps - Open Source Token-Free Style
   const styleUrl = `https://tiles.stadiamaps.com/styles/alidade_smooth_dark.json`;
 
-  // Update tiles when year changes
+  // Update tiles when year or mode changes
   useEffect(() => {
+    // Safety check 1: Ref must exist
     if (!mapRef.current) return;
 
+    // Safety check 2: Get the underlying MapLibre instance
     const map = mapRef.current.getMap();
-    if (!map.isStyleLoaded()) return;
+    if (!map) return;
 
-    try {
-      console.log("Map refreshing for year:", year);
-      const tileUrl = `http://localhost:8000/api/tiles/${year}/{z}/{x}/{y}.png?v=${year}`;
-      
-      const source = map.getSource('satellite-source') as any;
-      if (source && 'setTiles' in source) {
-        // Efficiently update existing source without removing layers
-        source.setTiles([tileUrl]);
-      } else {
-        // Fallback: Add source and layer if they don't exist yet
-        if (!map.getSource('satellite-source')) {
-          map.addSource('satellite-source', {
-            type: 'raster',
-            tiles: [tileUrl],
-            tileSize: 256
-          });
-        }
-        
-        if (!map.getLayer('satellite-layer')) {
-          // Add satellite layer as base imagery (at the bottom)
-          // We don't use beforeId here to avoid the "non-existing layer" error
-          // By adding it first or using map.addLayer(..., someBaseLayerId)
-          map.addLayer({
-            id: 'satellite-layer',
-            type: 'raster',
-            source: 'satellite-source',
-            paint: { 'raster-opacity': 0.8 }
-          }, map.getLayer('erosion-layer') ? 'erosion-layer' : undefined);
-        }
-      }
-
-      map.fire('yearchange', { year });
-    } catch (err) {
-      console.error("Error refreshing map data:", err);
+    // Safety check 3: Wait until style is fully loaded
+    if (!mapLoaded || !map.isStyleLoaded()) {
+      console.log("Map or style not ready yet, skipping tile update");
+      return;
     }
-  }, [year]);
+
+    const refreshTiles = async () => {
+      try {
+        console.log(`Frontend requesting tiles for year: ${year}, mode: ${mode}`);
+        // Add cache-busting version parameter
+        const response = await fetch(`http://localhost:8000/api/tiles?year=${year}&mode=${mode}&v=${Date.now()}`);
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch tiles: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const tileUrl = data.url;
+
+        if (!tileUrl) {
+          console.error("No tile URL returned from backend");
+          return;
+        }
+
+        // Nuclear Option: Remove existing layer and source to force refresh
+        if (map.getLayer('satellite-layer')) {
+          map.removeLayer('satellite-layer');
+        }
+        if (map.getSource('satellite-source')) {
+          map.removeSource('satellite-source');
+        }
+
+        // Re-add source with new dynamic URL
+        map.addSource('satellite-source', {
+          type: 'raster',
+          tiles: [tileUrl],
+          tileSize: 256
+        });
+
+        // Re-add layer at the bottom (before erosion layer if it exists)
+        map.addLayer({
+          id: 'satellite-layer',
+          type: 'raster',
+          source: 'satellite-source',
+          paint: { 'raster-opacity': 0.8 }
+        }, map.getLayer('erosion-layer') ? 'erosion-layer' : undefined);
+
+        console.log(`Successfully updated map tiles for year ${year}`);
+        map.fire('yearchange', { year });
+      } catch (err) {
+        console.error("Error refreshing map data:", err);
+      }
+    };
+
+    refreshTiles();
+  }, [year, mode, mapLoaded]);
 
   return (
     <div className="relative w-full h-full">
@@ -80,12 +104,15 @@ const MapComponent = ({ year, analysisData, isLoading }: MapComponentProps) => {
         ref={mapRef}
         {...viewState}
         onMove={evt => setViewState(evt.viewState)}
+        onLoad={() => setMapLoaded(true)}
+        onStyleData={() => {
+          // Additional safety to ensure style-dependent operations are possible
+          const map = mapRef.current?.getMap();
+          if (map?.isStyleLoaded()) setMapLoaded(true);
+        }}
         style={{ width: '100%', height: '100%' }}
         mapStyle={styleUrl}
       >
-        {/* We define sources and layers dynamically in useEffect to ensure 
-            proper ordering and error handling in Next.js 16 / Turbopack */}
-        
         {/* Render analysis data if available */}
         {analysisData && (
           <Source id="erosion-data" type="geojson" data={{
@@ -102,34 +129,36 @@ const MapComponent = ({ year, analysisData, isLoading }: MapComponentProps) => {
               paint={{
                 'fill-color': COLORS.erosion,
                 'fill-opacity': 0.5,
-                'fill-outline-color': COLORS.erosion,
+                'fill-outline-color': '#fff'
               }}
             />
           </Source>
         )}
       </Map>
-      
-      {/* Loading Overlay */}
-      <AnimatePresence>
-        {isLoading && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-slate-950/40 backdrop-blur-[2px] z-50 flex items-center justify-center pointer-events-none"
-          >
-            <div className="flex flex-col items-center gap-3">
-              <div className="w-10 h-10 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin" />
-              <span className="text-xs font-bold text-emerald-400 uppercase tracking-widest bg-slate-900/80 px-4 py-2 rounded-lg border border-emerald-500/20">
-                Updating Satellite Layer: {year}
-              </span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-      
-      {/* Top Right Panel Container */}
+
+      {/* Mode Toggle Overlay */}
       <div className="absolute top-6 right-6 z-10 flex flex-col gap-4 pointer-events-auto">
+        <div className="flex bg-slate-900/60 backdrop-blur-md p-1 rounded-lg border border-white/10 shadow-2xl">
+          <button
+            onClick={() => setMode('natural')}
+            className={`px-4 py-1.5 rounded-md text-xs font-bold uppercase tracking-wider transition-all ${mode === 'natural'
+              ? 'bg-emerald-500 text-white shadow-lg'
+              : 'text-slate-400 hover:text-slate-200'
+              }`}
+          >
+            Natural
+          </button>
+          <button
+            onClick={() => setMode('ndvi')}
+            className={`px-4 py-1.5 rounded-md text-xs font-bold uppercase tracking-wider transition-all ${mode === 'ndvi'
+              ? 'bg-emerald-500 text-white shadow-lg'
+              : 'text-slate-400 hover:text-slate-200'
+              }`}
+          >
+            NDVI
+          </button>
+        </div>
+
         {/* Observation Year Panel */}
         <AnimatePresence mode="wait">
           <motion.div
@@ -150,6 +179,25 @@ const MapComponent = ({ year, analysisData, isLoading }: MapComponentProps) => {
         {/* Map Legend Component */}
         <MapLegend />
       </div>
+
+      {/* Loading Overlay */}
+      <AnimatePresence>
+        {isLoading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-slate-950/40 backdrop-blur-[2px] z-50 flex items-center justify-center pointer-events-none"
+          >
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-10 h-10 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin" />
+              <span className="text-xs font-bold text-emerald-400 uppercase tracking-widest bg-slate-900/80 px-4 py-2 rounded-lg border border-emerald-500/20">
+                Updating Satellite Layer: {year}
+              </span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };

@@ -5,11 +5,11 @@ import { Leaf, Waves, Home, BarChart3, ShieldAlert, Settings, Download, Loader2 
 import { motion, useMotionValue, animate } from 'framer-motion';
 
 interface SidebarProps {
-    analysisData?: any;
+    analysisData?: Record<string, unknown> | null;
     currentYear?: number;
 }
 
-const Counter = ({ value, label, prefix = "" }: { value: number; label: string; prefix?: string }) => {
+const Counter = ({ value, prefix = "" }: { value: number; label?: string; prefix?: string }) => {
     const count = useMotionValue(0);
     const [displayValue, setDisplayValue] = useState(prefix + "0.0");
 

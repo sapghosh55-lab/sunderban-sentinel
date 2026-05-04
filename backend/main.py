@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 import io
 from fpdf import FPDF
+import ee
+import json
 
 from predict import run_pipeline
 from utils.carbon_engine import calculate_carbon_impact
@@ -16,12 +18,50 @@ import numpy as np
 # Load environment variables
 load_dotenv()
 
+# Google Earth Engine Authentication
+GEE_JSON_PATH = os.path.join(os.path.dirname(__file__), "gee-service-account.json.json")
+
+# Global GEE initialization status
+GEE_INITIALIZED = False
+
+def initialize_gee():
+    global GEE_INITIALIZED
+    if not os.path.exists(GEE_JSON_PATH):
+        print(f"CRITICAL: GEE Service Account file missing at {GEE_JSON_PATH}")
+        GEE_INITIALIZED = False
+        return False
+    
+    try:
+        with open(GEE_JSON_PATH) as f:
+            account_info = json.load(f)
+            client_email = account_info.get("client_email")
+            
+        if not client_email:
+            print("CRITICAL: Invalid Service Account JSON - missing client_email")
+            GEE_INITIALIZED = False
+            return False
+            
+        credentials = ee.ServiceAccountCredentials(client_email, GEE_JSON_PATH)
+        ee.Initialize(credentials)
+        print("Google Earth Engine initialized successfully.")
+        GEE_INITIALIZED = True
+        return True
+    except Exception as e:
+        print(f"CRITICAL: GEE Initialization Failed: {str(e)}")
+        if "permission" in str(e).lower():
+            print("ERROR: Service Account may lack necessary Earth Engine permissions.")
+        GEE_INITIALIZED = False
+        return False
+
+# Initialize GEE on startup
+initialize_gee()
+
 app = FastAPI(title="Sundarbans Sentinel API")
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, specify the actual origin
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,16 +159,67 @@ async def generate_report(request: ReportRequest):
         print(f"Report generation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
 
-@app.get("/api/tiles/{year}/{z}/{x}/{y}.png")
-async def get_tiles(year: int, z: int, x: int, y: int):
+@app.get("/api/tiles")
+async def get_tiles(year: int, mode: str = "natural"):
     """
-    Endpoint to serve dynamic satellite tiles for a specific year.
-    Ensures that imagery is dynamic and responds to the selected year.
+    Returns a dynamic Google Earth Engine MapID URL for satellite tiles.
+    Accepts year and mode (natural/ndvi) as query parameters.
     """
-    print(f"DEBUG: Generating tiles for year: {year} at zoom {z}, x {x}, y {y}")
-    # In production, this would call a custom tile server or data provider
-    # Ensure the year is passed correctly to any underlying fetcher
-    return Response(content=b"", media_type="image/png")
+    if not GEE_INITIALIZED:
+        raise HTTPException(status_code=503, detail="Google Earth Engine not initialized. Check server logs.")
+    
+    print(f"DEBUG: Backend received year request for: {year}, mode: {mode}")
+    try:
+        # Sundarbans bounding box (specific and compact to avoid timeouts)
+        region = ee.Geometry.Rectangle([88.5, 21.5, 89.2, 22.2])
+        
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+        
+        # Filter Sentinel-2 L2A collection using the dynamic year
+        collection = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                      .filterBounds(region)
+                      .filterDate(start_date, end_date)
+                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)))
+        
+        # Check if collection is empty
+        count = collection.size().getInfo()
+        print(f"DEBUG: Found {count} images for year {year}")
+        
+        if count == 0:
+            # Fallback to a wider date range if no images found in the specific year
+            print(f"WARNING: No images found for {year}, expanding search...")
+            collection = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                          .filterBounds(region)
+                          .filterDate(f"{year-1}-01-01", f"{year+1}-12-31")
+                          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+
+        # Create cloud-free composite using median reducer
+        image = collection.median().clip(region)
+        
+        if mode == "ndvi":
+            ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+            vis_params = {
+                'min': 0,
+                'max': 0.8,
+                'palette': ['#FFFFFF', '#CE7E45', '#DF923D', '#F1B555', '#FCD163', '#99B718', '#74A901', '#66A000', '#529400', '#3E8601', '#207401', '#056201', '#004C00', '#023B01', '#012E01', '#011D01', '#011301']
+            }
+            map_id_dict = ndvi.getMapId(vis_params)
+        else:
+            # Natural Color (B4, B3, B2)
+            vis_params = {
+                'bands': ['B4', 'B3', 'B2'],
+                'min': 0,
+                'max': 3000,
+                'gamma': 1.4
+            }
+            map_id_dict = image.getMapId(vis_params)
+            
+        return {"url": map_id_dict['tile_fetcher'].url_format}
+        
+    except Exception as e:
+        print(f"GEE Tile Generation Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"GEE Tile Error: {str(e)}")
 
 @app.get("/api/stats")
 async def get_stats(year: int):
@@ -146,8 +237,11 @@ async def get_stats(year: int):
     }
     return stats
 
-@app.post("/analyze")
+@app.post("/api/analyze")
 async def analyze_area(request: AnalysisRequest):
+    if not GEE_INITIALIZED:
+        raise HTTPException(status_code=503, detail="Google Earth Engine not initialized. Check server logs.")
+        
     if not request.geojson or len(request.date_range) != 2:
         raise HTTPException(status_code=400, detail="Invalid GeoJSON or date range")
     
